@@ -1,6 +1,6 @@
-# summarizer
-#
+# Summarizer
+
 Runs as https://obedio.ai
-Parameters are:
-/s?file=[directory]/filename.pdf
-/g?file=filename.pdf # meetings folder is assumed
+### Parameters are:
+- /s?file=[directory]/filename.pdf
+- /g?file=filename.pdf # meetings folder is assumed
