@@ -1,106 +1,260 @@
 #!/usr/bin/env python3
-#
 import functions_framework
-import vertexai
-from vertexai.generative_models import GenerativeModel, Part
+from google import genai
+from google.genai import types
 from google.cloud import storage
-
-# Configuration
-PROJECT_ID = "obedio"  # Replace with your project ID
-LOCATION = "us-central1"        # Replace with your region
-BUCKET_NAME = "obedio.appspot.com" # Replace with your GCS bucket name
-
-# Initialize Vertex AI
-vertexai.init(project=PROJECT_ID, location=LOCATION)
+from google.cloud import bigquery
+import pypdf
+import io
+import json
+import datetime
+import decimal
+# --- Configuration ---
+PROJECT_ID = "obedio"
+LOCATION = "us-central1"
+BUCKET_NAME = "obedio.appspot.com"
+# Limits
+MAX_FILE_SIZE_MB = 300
+TRUNCATE_LIMIT = 50
+FALLBACK_PAGES = 25
+# --- Initialize Services (Global Scope for Warm Start) ---
+genai_client = genai.Client(vertexai=True, project=PROJECT_ID, location=LOCATION)
 storage_client = storage.Client(project=PROJECT_ID)
-
+bq_client = bigquery.Client(project=PROJECT_ID)
 @functions_framework.http
 def main_router(request):
-    path = request.path.rstrip('/')
-    if path == '/g':
+    """
+    Main Router handling:
+    /g -> Get File (GCS)
+    /s -> Summarize (Gemini)
+    /q -> Query Data (BigQuery for Google Charts)
+    """
+    # Remove trailing slash for consistency
+    path = request.path.rstrip("/")
+    if path == "/g":
         return get_file(request)
-    elif path == '/s':
+    elif path == "/s":
         return summarize_pdf(request)
+    elif path == "/q":
+        return query_bigquery_charts(request)
     else:
-        return f"Invalid request", 500
-
+        # Check if it's a root OPTIONS request (CORS) or just a 404
+        if request.method == "OPTIONS":
+            return handle_cors_options()
+        return "Invalid route. Use /g, /s, or /q.", 404
+# ---------------------------------------------------------
+# ROUTE: /g (Get File)
+# ---------------------------------------------------------
 def get_file(request):
     """Reads a file from GCS/meetings and returns it raw."""
-    filename = request.args.get('file')
-    
+    filename = request.args.get("file")
     if not filename:
-        return 'Error: Please provide a "file" parameter.', 400
-
+        return 'Error: Missing "file" param.', 400
     try:
-        # Target the specific subfolder 'meetings'
         bucket = storage_client.bucket(BUCKET_NAME)
         blob = bucket.blob(f"meetings/{filename}")
-
         if not blob.exists():
-            return f"Error: File '{filename}' not found in meetings/ folder.", 404
-
-        # Download content as bytes (RAM heavy for huge files, fine for docs)
+            return "Error: File not found.", 404
         file_content = blob.download_as_bytes()
-        
-        # Get the correct content type (e.g., application/pdf, image/png)
-        # If unknown, default to octet-stream
-        content_type = blob.content_type or 'application/octet-stream'
-
-        return file_content, 200, {'Content-Type': content_type}
-
+        content_type = blob.content_type or "application/octet-stream"
+        return file_content, 200, {"Content-Type": content_type}
     except Exception as e:
         return f"Error retrieving file: {str(e)}", 500
-
+# ---------------------------------------------------------
+# ROUTE: /s (Summarize PDF)
+# ---------------------------------------------------------
 def summarize_pdf(request):
-    """HTTP Cloud Function to summarize a PDF from GCS."""
-    
-    # 1. Parse the filename and instructions from the URL link
-    request_args = request.args
-    if request_args and 'file' in request_args:
-        filename = request_args['file']
-    else:
-        return 'Error: Please provide a "file" parameter in the link.', 400
-
-    # Optional: Allow custom instructions via the link, or use a default
-    custom_instructions = request_args.get('instructions', 'Summarize this document, focusing on areas related to licensing of any kind, land use, bonds, and taxation. I am especially interested in contact information whereever you find it, including names, titles, companies, email, and phone numbers. Be as verbose as you can but keep it to a screens worth of text, maybe 24 lines by 80 characters. Make sure the output is html.')
-
-    # 2. Construct the reference to the file in Google Cloud Storage
-    # Gemini on Vertex AI can read directly from "gs://" URIs
-    file_uri = f"gs://{BUCKET_NAME}/{filename}"
-    
+    """Summarizes PDF with Custom Obedio Styling."""
+    filename = request.args.get("file")
+    topic = request.args.get("topic")
+    theme = request.args.get("theme")
+    if not filename:
+        return 'Error: Missing "file" param.', 400
+    # Base instructions
+    default_instr_parts = [
+        "Summarize this in html and get related contact info and url links.",
+        "Make it look nice with html formatting.",
+        "The left and right margins should be about 1 inch wide on a standard letter page. ",
+        'Put a header at the top with the title "Obedio AI-Generated Document Summary". ',
+        "Add this at the very bottom in muted, small text: "
+        '"Disclaimer: This document was generated by Obedio AI from the first 25 pages of the original source document. While we strive for accuracy, please verify critical details with the original source document. AI can be wildly inaccurate."',
+        "Do not add any other text outside the HTML structure.",
+    ]
+    # Add topic/theme instruction if present
+    if topic or theme:
+        special_instruction = "Make sure to pick up on anything related to"
+        if topic:
+            special_instruction += f" the topic of '{topic}'"
+        if topic and theme:
+            special_instruction += " and"
+        if theme:
+            special_instruction += f" the theme of '{theme}'"
+        special_instruction += "."
+        default_instr_parts.insert(1, special_instruction)
+    default_instr = " ".join(default_instr_parts)
+    custom_instructions = request.args.get("instructions", default_instr)
     try:
-        # 3. Load the Model
-        model = GenerativeModel("gemini-2.5-flash")
-
-        # 4. Create the prompt with the file reference
-        pdf_file = Part.from_uri(
-            mime_type="application/pdf",
-            uri=file_uri
+        # 1. Check File Size (Metadata)
+        bucket = storage_client.bucket(BUCKET_NAME)
+        blob = bucket.blob(filename)
+        if not blob.exists():
+            return f"Error: File '{filename}' not found.", 404
+        blob.reload()
+        file_size_mb = blob.size / (1024 * 1024)
+        if file_size_mb > MAX_FILE_SIZE_MB:
+            return (
+                f"Error: File is {file_size_mb:.2f}MB. Limit is {MAX_FILE_SIZE_MB}MB.",
+                400,
+            )
+        # 2. Download
+        pdf_bytes = blob.download_as_bytes()
+        try:
+            input_stream = io.BytesIO(pdf_bytes)
+            pdf_reader = pypdf.PdfReader(input_stream)
+            num_pages = len(pdf_reader.pages)
+        except Exception as e:
+            return f"Error reading PDF structure: {str(e)}", 400
+        # 3. Prepare Content
+        parts = []
+        if num_pages > TRUNCATE_LIMIT or file_size_mb > 30:
+            output_stream = io.BytesIO()
+            pdf_writer = pypdf.PdfWriter()
+            limit = min(FALLBACK_PAGES, num_pages)
+            for i in range(limit):
+                pdf_writer.add_page(pdf_reader.pages[i])
+            pdf_writer.write(output_stream)
+            truncated_bytes = output_stream.getvalue()
+            parts.append(
+                types.Part.from_bytes(data=truncated_bytes, mime_type="application/pdf")
+            )
+            custom_instructions += (
+                f" [NOTE: File truncated. You are seeing the first {limit} pages.]"
+            )
+        else:
+            file_uri = f"gs://{BUCKET_NAME}/{filename}"
+            parts.append(
+                types.Part.from_uri(file_uri=file_uri, mime_type="application/pdf")
+            )
+        parts.append(types.Part.from_text(text=custom_instructions))
+        # 4. Generate Content
+        response = genai_client.models.generate_content(
+            model="gemini-2.0-flash", contents=[types.Content(role="user", parts=parts)]
         )
-        
-        # 5. Generate content
-        responses = model.generate_content(
-            [pdf_file, custom_instructions],
-            stream=False
-        )
-        
-	# 6. Clean the output
-        # This removes the ```html at the start and ``` at the end
-        cleaned_text = responses.text.replace('```html', '').replace('```', '')
-        
-        # If the model added "Here is your html:" text before the code, 
-        # this safeguard looks for the first HTML tag and starts there (optional but safer)
-        if "<html" in cleaned_text:
-             start_index = cleaned_text.find("<html")
-             cleaned_text = cleaned_text[start_index:]
-        elif "<!DOCTYPE" in cleaned_text:
-             start_index = cleaned_text.find("<!DOCTYPE")
-             cleaned_text = cleaned_text[start_index:]
-
-        # 7. Return the text with HTML headers
-        # We add the dictionary {'Content-Type': 'text/html'} at the end
-        return cleaned_text, 200, {'Content-Type': 'text/html'}
-
+        # 5. Safety & Empty Check
+        if not response.text:
+            return (
+                f"Error: AI returned empty text. Reason: {response.candidates[0].finish_reason}",
+                500,
+            )
+        # 6. Clean Output
+        cleaned_text = response.text.replace("```html", "").replace("```", "")
+        if "<!DOCTYPE" in cleaned_text:
+            cleaned_text = cleaned_text[cleaned_text.find("<!DOCTYPE") :]
+        elif "<html" in cleaned_text:
+            cleaned_text = cleaned_text[cleaned_text.find("<html") :]
+        return cleaned_text, 200, {"Content-Type": "text/html"}
     except Exception as e:
         return f"Error processing file: {str(e)}", 500
-
+# ---------------------------------------------------------
+# ROUTE: /q (BigQuery Charts API)
+# ---------------------------------------------------------
+def query_bigquery_charts(request):
+    """Queries BigQuery and returns data formatted for Google Charts."""
+    # Handle CORS specifically for this endpoint
+    if request.method == "OPTIONS":
+        return handle_cors_options()
+    headers = {"Access-Control-Allow-Origin": "*"}
+    # 1. Parse Parameters
+    request_json = request.get_json(silent=True)
+    request_args = request.args
+    code_param = request_args.get("code") or (request_json and request_json.get("code"))
+    topic_param = request_args.get("topic") or (
+        request_json and request_json.get("topic")
+    )
+    theme_param = request_args.get("theme") or (
+        request_json and request_json.get("theme")
+    )
+    # 2. Build SQL
+    sql = "SELECT * FROM `obedio.meetings.list`"
+    where_clauses = []
+    query_params = []
+    if code_param:
+        where_clauses.append("code = @code")
+        query_params.append(bigquery.ScalarQueryParameter("code", "STRING", code_param))
+    if topic_param:
+        where_clauses.append("LOWER(topic) LIKE @topic")
+        query_params.append(
+            bigquery.ScalarQueryParameter("topic", "STRING", f"%{topic_param.lower()}%")
+        )
+    if theme_param:
+        where_clauses.append("LOWER(theme) LIKE @theme")
+        query_params.append(
+            bigquery.ScalarQueryParameter("theme", "STRING", f"%{theme_param.lower()}%")
+        )
+    if where_clauses:
+        sql += " WHERE " + " AND ".join(where_clauses)
+    # 3. Execute
+    try:
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=query_params, use_legacy_sql=False
+        )
+        query_job = bq_client.query(sql, job_config=job_config)
+        rows = query_job.result()  # Waits for completion
+        # 4. Format Output
+        schema = rows.schema
+        cols = [
+            {
+                "id": field.name,
+                "label": field.name,
+                "type": map_bq_type_to_charts(field.field_type),
+            }
+            for field in schema
+        ]
+        chart_rows = []
+        for row in rows:
+            cells = []
+            for field in schema:
+                val = row[field.name]
+                formatted_val = format_value_for_charts(val, field.field_type)
+                cells.append({"v": formatted_val})
+            chart_rows.append({"c": cells})
+        data_table = {"cols": cols, "rows": chart_rows}
+        return json.dumps(data_table), 200, headers
+    except Exception as e:
+        print(f"BQ Error: {e}")
+        return json.dumps({"error": str(e)}), 500, headers
+# ---------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------
+def handle_cors_options():
+    headers = {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, POST",
+        "Access-Control-Allow-Headers": "Content-Type",
+        "Access-Control-Max-Age": "3600",
+    }
+    return "", 204, headers
+def map_bq_type_to_charts(bq_type):
+    t = bq_type.upper()
+    if t in ("INTEGER", "INT64", "FLOAT", "FLOAT64", "NUMERIC", "BIGNUMERIC"):
+        return "number"
+    elif t in ("BOOLEAN", "BOOL"):
+        return "boolean"
+    elif t == "DATE":
+        return "date"
+    elif t in ("DATETIME", "TIMESTAMP"):
+        return "datetime"
+    return "string"
+def format_value_for_charts(val, bq_type):
+    if val is None:
+        return None
+    t = bq_type.upper()
+    if t == "DATE":
+        # val is datetime.date. Month is 0-indexed in JS.
+        return f"Date({val.year}, {val.month - 1}, {val.day})"
+    elif t in ("DATETIME", "TIMESTAMP"):
+        # val is datetime.datetime
+        return f"Date({val.year}, {val.month - 1}, {val.day}, {val.hour}, {val.minute}, {val.second})"
+    elif t in ("NUMERIC", "BIGNUMERIC"):
+        return float(val)
+    return val
