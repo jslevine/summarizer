@@ -18,30 +18,44 @@ MAX_FILE_SIZE_MB = 300
 TRUNCATE_LIMIT = 50
 FALLBACK_PAGES = 25
 # --- Initialize Services (Global Scope for Warm Start) ---
-genai_client = genai.Client(vertexai=True, project=PROJECT_ID, location=LOCATION)
-storage_client = storage.Client(project=PROJECT_ID)
-bq_client = bigquery.Client(project=PROJECT_ID)
+_genai_client = None
+_storage_client = None
+_bq_client = None
+def get_genai_client():
+    global _genai_client
+    if _genai_client is None:
+        _genai_client = genai.Client(
+            vertexai=True, project=PROJECT_ID, location=LOCATION
+        )
+    return _genai_client
+def get_storage_client():
+    global _storage_client
+    if _storage_client is None:
+        _storage_client = storage.Client(project=PROJECT_ID)
+    return _storage_client
+def get_bq_client():
+    global _bq_client
+    if _bq_client is None:
+        _bq_client = bigquery.Client(project=PROJECT_ID)
+    return _bq_client
 @functions_framework.http
 def main_router(request):
-    """
-    Main Router handling:
-    /g -> Get File (GCS)
-    /s -> Summarize (Gemini)
-    /q -> Query Data (BigQuery for Google Charts)
-    """
-    # Remove trailing slash for consistency
     path = request.path.rstrip("/")
+    if path == "":
+        print("Health check request received", flush=True)
+        return "OK", 200
     if path == "/g":
         return get_file(request)
     elif path == "/s":
         return summarize_pdf(request)
     elif path == "/q":
         return query_bigquery_charts(request)
+    elif path == "/j":  # <--- Add this
+        return query_bigquery_json(request)
     else:
-        # Check if it's a root OPTIONS request (CORS) or just a 404
         if request.method == "OPTIONS":
             return handle_cors_options()
-        return "Invalid route. Use /g, /s, or /q.", 404
+        return "Invalid route. Use /g, /s, /q, or /j.", 404
 # ---------------------------------------------------------
 # ROUTE: /g (Get File)
 # ---------------------------------------------------------
@@ -51,7 +65,7 @@ def get_file(request):
     if not filename:
         return 'Error: Missing "file" param.', 400
     try:
-        bucket = storage_client.bucket(BUCKET_NAME)
+        bucket = get_storage_client().bucket(BUCKET_NAME)
         blob = bucket.blob(f"meetings/{filename}")
         if not blob.exists():
             return "Error: File not found.", 404
@@ -95,7 +109,7 @@ def summarize_pdf(request):
     custom_instructions = request.args.get("instructions", default_instr)
     try:
         # 1. Check File Size (Metadata)
-        bucket = storage_client.bucket(BUCKET_NAME)
+        bucket = get_storage_client().bucket(BUCKET_NAME)
         blob = bucket.blob(filename)
         if not blob.exists():
             return f"Error: File '{filename}' not found.", 404
@@ -137,7 +151,7 @@ def summarize_pdf(request):
             )
         parts.append(types.Part.from_text(text=custom_instructions))
         # 4. Generate Content
-        response = genai_client.models.generate_content(
+        response = get_genai_client().models.generate_content(
             model="gemini-2.0-flash", contents=[types.Content(role="user", parts=parts)]
         )
         # 5. Safety & Empty Check
@@ -174,13 +188,51 @@ def query_bigquery_charts(request):
     theme_param = request_args.get("theme") or (
         request_json and request_json.get("theme")
     )
+    state_param = request_args.get("state") or (
+        request_json and request_json.get("state")
+    )
+    find_param = request_args.get("find") or (request_json and request_json.get("find"))
+    from_param = request_args.get("from") or (request_json and request_json.get("from"))
+    to_param = request_args.get("to") or (request_json and request_json.get("to"))
+    # Check for special modes
+    dd_mode = "dd" in request_args
+    un_mode = "un" in request_args
+    # --- Mode: Unique Topics Only ---
+    if un_mode:
+        try:
+            # Fetch unique topics
+            topics_query = "SELECT DISTINCT topic FROM `obedio.meetings.meeting_details` WHERE topic IS NOT NULL ORDER BY topic"
+            topics_job = get_bq_client().query(topics_query)
+            topics = [row[0] for row in topics_job.result()]
+            return json.dumps(topics), 200, headers
+        except Exception as e:
+            return json.dumps({"error": str(e)}), 500, headers
     # 2. Build SQL
-    sql = "SELECT * FROM `obedio.meetings.list`"
+    sql = "SELECT * FROM `obedio.meetings.meeting_details` AS t"
     where_clauses = []
     query_params = []
+    if find_param:
+        where_clauses.append("CONTAINS_SUBSTR(t, @find)")
+        query_params.append(bigquery.ScalarQueryParameter("find", "STRING", find_param))
     if code_param:
-        where_clauses.append("code = @code")
-        query_params.append(bigquery.ScalarQueryParameter("code", "STRING", code_param))
+        processed_codes = []
+        # Split by comma and process each code
+        for raw_code in code_param.split(","):
+            c = raw_code.strip()
+            if not c:
+                continue
+            # Check if code starts with M or S
+            if c[0].upper() in ("M", "S"):
+                processed_codes.append(c)
+            else:
+                # Assume M, and pad the numeric part to 8 digits
+                # E.g. "123" -> "M00000123"
+                processed_codes.append(f"M{c.zfill(8)}")
+        if processed_codes:
+            where_clauses.append("jcode IN UNNEST(@codes)")
+            query_params.append(
+                bigquery.ArrayQueryParameter("codes", "STRING", processed_codes)
+            )
     if topic_param:
         where_clauses.append("LOWER(topic) LIKE @topic")
         query_params.append(
@@ -191,14 +243,37 @@ def query_bigquery_charts(request):
         query_params.append(
             bigquery.ScalarQueryParameter("theme", "STRING", f"%{theme_param.lower()}%")
         )
+    if state_param and state_param.lower() != "all":
+        # Clean up input: "ca, ny " -> ["CA", "NY"]
+        states = [s.strip().upper() for s in state_param.split(",")]
+        if states:
+            where_clauses.append("state IN UNNEST(@states)")
+            query_params.append(
+                bigquery.ArrayQueryParameter("states", "STRING", states)
+            )
+    if from_param:
+        where_clauses.append("date >= @from_date")
+        query_params.append(
+            bigquery.ScalarQueryParameter("from_date", "DATE", from_param)
+        )
+    if to_param:
+        where_clauses.append("date <= @to_date")
+        query_params.append(bigquery.ScalarQueryParameter("to_date", "DATE", to_param))
     if where_clauses:
         sql += " WHERE " + " AND ".join(where_clauses)
+    # Sort by date descending
+    sql += " ORDER BY date DESC"
+    # --- Mode: Data Definition (Schema Only) ---
+    if dd_mode:
+        sql += " LIMIT 0"
+    else:
+        sql += " LIMIT 5000"
     # 3. Execute
     try:
         job_config = bigquery.QueryJobConfig(
             query_parameters=query_params, use_legacy_sql=False
         )
-        query_job = bq_client.query(sql, job_config=job_config)
+        query_job = get_bq_client().query(sql, job_config=job_config)
         rows = query_job.result()  # Waits for completion
         # 4. Format Output
         schema = rows.schema
@@ -222,6 +297,61 @@ def query_bigquery_charts(request):
         return json.dumps(data_table), 200, headers
     except Exception as e:
         print(f"BQ Error: {e}")
+        return json.dumps({"error": str(e)}), 500, headers
+# ---------------------------------------------------------
+# ROUTE: /j (JSON Data Export)
+# ---------------------------------------------------------
+def query_bigquery_json(request):
+    """Returns matching rows as a standard JSON array of objects."""
+    if request.method == "OPTIONS":
+        return handle_cors_options()
+    headers = {"Access-Control-Allow-Origin": "*", "Content-Type": "application/json"}
+    # 1. Parse parameters
+    state_param = request.args.get("state")
+    jtype_param = request.args.get("jtype")
+    # 2. Build SQL
+    sql = "SELECT * FROM `obedio.meetings.jurisdictions`"
+    query_params = []
+    where_clauses = []
+    # Filter by State
+    if state_param and state_param.lower() != "all":
+        # Clean up input: "ca, ny " -> ["CA", "NY"]
+        states = [s.strip().upper() for s in state_param.split(",")]
+        if states:
+            where_clauses.append("state IN UNNEST(@states)")
+            query_params.append(
+                bigquery.ArrayQueryParameter("states", "STRING", states)
+            )
+    # Filter by Type (M or S)
+    if jtype_param:
+        jtype_val = jtype_param.strip().upper()
+        if jtype_val in ("M", "S"):
+            where_clauses.append("jtype = @jtype")
+            query_params.append(
+                bigquery.ScalarQueryParameter("jtype", "STRING", jtype_val)
+            )
+    if where_clauses:
+        sql += " WHERE " + " AND ".join(where_clauses)
+    # 3. Execute
+    try:
+        job_config = bigquery.QueryJobConfig(query_parameters=query_params)
+        query_job = get_bq_client().query(sql, job_config=job_config)
+        rows = query_job.result()
+        # 4. Convert to list of dicts (BigQuery rows are Row objects)
+        # We use a custom encoder or manual conversion for Date/Decimal types
+        results = []
+        for row in rows:
+            dict_row = dict(row.items())
+            # Convert non-serializable types to strings/floats
+            for key, value in dict_row.items():
+                if isinstance(value, (datetime.date, datetime.datetime)):
+                    dict_row[key] = value.isoformat()
+                elif isinstance(value, decimal.Decimal):
+                    dict_row[key] = float(value)
+            results.append(dict_row)
+        return json.dumps(results), 200, headers
+    except Exception as e:
+        print(f"JSON Route Error: {e}")
         return json.dumps({"error": str(e)}), 500, headers
 # ---------------------------------------------------------
 # Helpers
