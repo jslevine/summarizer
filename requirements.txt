@@ -3,3 +3,4 @@ google-genai
 google-cloud-storage
 pypdf
 google-cloud-bigquery>=3.0.0
+debugpy
