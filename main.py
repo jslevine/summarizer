@@ -123,6 +123,10 @@ def summarize_pdf(request):
 ACT AS A RAW HTML GENERATOR. 
 Output ONLY valid HTML code. No talk. No Markdown. NO BACKTICKS (```).
 Summarize this document {focus_phrase}.
+### MANDATORY URL PROTOCOL:
+You MUST monitor for URLs at all times. If the source text mentions a website or link (e.g., [https://example.com](https://example.com)), you MUST include it immediately.
+- **Correct Format:** "For more info, visit <a href='[https://obedio.ai](https://obedio.ai)' style='color: #0066cc; text-decoration: underline;'>[https://obedio.ai](https://obedio.ai)</a>."
+- **Constraint:** Never remove a URL to save space. Never paraphrase a URL.
 ### MANDATORY HTML SKELETON:
 You MUST structure the output exactly like this:
 <div style="max-width: 800px; margin: 20px auto; padding: 5% 7%; font-family: sans-serif; line-height: 1.6; color: #333; background-color: #fff; border: 1px solid #e0e0e0; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.1);">
